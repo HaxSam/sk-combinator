@@ -14,13 +14,13 @@ const Combinator = enum(u8) {
     Y = 'Y',
 };
 
-const Operator = union(enum) { comb: Combinator, vari: u8 };
+const Operator = union(enum) { comb: Combinator, vari: u8, unknown: void };
 
 const Expr = struct {
     const Self = @This();
 
     op: Operator,
-    stack: std.ArrayList(Expr),
+    stack: std.ArrayList(Self),
 
     pub fn init(op: Operator, allocator: Allocator) Self {
         return Self{
@@ -29,10 +29,86 @@ const Expr = struct {
         };
     }
 
+    pub fn initWithStack(op: Operator, stack: []const Expr, allocator: Allocator) !Self {
+        var s: std.ArrayList(Self) = try .initCapacity(allocator, stack.len);
+        for (stack) |expr|
+            try s.insert(0, try expr.clone());
+
+        return Self{
+            .op = op,
+            .stack = s,
+        };
+    }
+
+    pub fn initWithStackOp(op: Operator, stack: []const Operator, allocator: Allocator) !Self {
+        var s: std.ArrayList(Self) = try .initCapacity(allocator, stack.len);
+        for (stack) |oper|
+            try s.insert(0, init(oper, allocator));
+
+        return Self{
+            .op = op,
+            .stack = s,
+        };
+    }
+
+    pub fn initWithStackComb(op: Combinator, stack: []const Combinator, allocator: Allocator) !Self {
+        var s: std.ArrayList(Self) = try .initCapacity(allocator, stack.len);
+        for (stack) |oper|
+            try s.insert(0, init(.{ .comb = oper }, allocator));
+
+        return Self{
+            .op = .{ .comb = op },
+            .stack = s,
+        };
+    }
+
+    pub fn number(n: usize, allocator: Allocator) !Self {
+        var res = init(.{ .unknown = {} }, allocator);
+        var cur = &res;
+
+        op: switch (n) {
+            0 => {
+                cur.op = .{ .comb = .A };
+                return res;
+            },
+            1 => {
+                cur.op = .{ .comb = .I };
+                return res;
+            },
+            2 => {
+                cur.op = .{ .comb = .W };
+                try cur.appendEndComb(.B);
+                return res;
+            },
+            3 => {
+                cur.op = .{ .comb = .S };
+                try cur.appendEndExpr(try initWithStackComb(.W, ([_]Combinator{.B})[0..], allocator));
+                try cur.appendEndComb(.B);
+                return res;
+            },
+            else => |count| {
+                if (count % 2 == 1) {
+                    cur.op = .{ .comb = .S };
+                    try cur.appendEndExpr(init(.{ .unknown = {} }, allocator));
+                    try cur.appendEndComb(.B);
+                    cur = &cur.stack.items[0];
+                }
+
+                cur.op = .{ .comb = .B };
+                try cur.appendEndExpr(init(.{ .unknown = {} }, allocator));
+                try cur.appendEndExpr(try initWithStackComb(.W, ([_]Combinator{.B})[0..], allocator));
+                cur = &cur.stack.items[0];
+
+                continue :op count / 2;
+            },
+        }
+    }
+
     pub fn parser(str: []const u8, allocator: Allocator) !Self {
         var stack: std.ArrayList(Expr) = .init(allocator);
         defer stack.deinit();
         var root: ?Expr = null;
+        var num: ?usize = null;
 
         var i: usize = 0;
         op: switch (str[i]) {
@@ -58,6 +134,27 @@ const Expr = struct {
                 if (i != str.len)
                     continue :op str[i];
             },
+            '0'...'9' => |c| {
+                const char_number = @as(usize, c - 0x30);
+                if (num) |*n| {
+                    n.* = char_number + 10 * n.*;
+                } else {
+                    num = char_number;
+                }
+
+                i += 1;
+                if (i != str.len) {
+                    if (!(str[i] >= '0' and str[i] <= '9')) {
+                        if (root) |*expr| {
+                            try expr.appendStartExpr(try number(num.?, allocator));
+                        } else {
+                            root = try number(num.?, allocator);
+                        }
+                        num = null;
+                    }
+                    continue :op str[i];
+                }
+            },
             '(' => {
                 if (root) |expr| {
                     try stack.append(expr);
@@ -75,9 +172,25 @@ const Expr = struct {
                         var pre_root = stack.pop().?;
                         try pre_root.appendStartExpr(expr);
                         root = pre_root;
+                    } else {
+                        var pre_root = stack.pop().?;
+                        try pre_root.appendStartExpr(try number(num.?, allocator));
+                        root = pre_root;
                     }
                 }
 
+                if (i != str.len)
+                    continue :op str[i];
+            },
+            '+' => {
+                if (root) |*expr| {
+                    try expr.appendStartExpr(try initWithStackComb(.S, ([_]Combinator{.B})[0..], allocator));
+                } else {
+                    root = init(.{ .comb = .S }, allocator);
+                    try root.?.appendEndComb(.B);
+                }
+
+                i += 1;
                 if (i != str.len)
                     continue :op str[i];
             },
@@ -86,6 +199,14 @@ const Expr = struct {
                 if (i != str.len)
                     continue :op str[i];
             },
+        }
+
+        if (num) |n| {
+            if (root) |*expr| {
+                try expr.appendStartExpr(try number(n, allocator));
+            } else {
+                root = try number(n, allocator);
+            }
         }
 
         return root.?;
@@ -102,6 +223,20 @@ const Expr = struct {
         switch (self.op) {
             .comb => |comb| return @intFromEnum(comb),
             .vari => |vari| return vari,
+            .unknown => return 255,
+        }
+    }
+
+    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        try writer.print("{c}", .{self.char()});
+
+        var i = self.stack.items.len;
+        while (i > 0) : (i -= 1) {
+            const expr = self.stack.items[i - 1];
+            if (expr.stack.items.len != 0)
+                try writer.writeAll("(");
+            try expr.format(fmt, options, writer);
+            try writer.writeAll(if (expr.stack.items.len != 0) ")" else "");
         }
     }
 
@@ -113,17 +248,11 @@ const Expr = struct {
     }
 
     pub fn appendEndComb(self: *Self, op: Combinator) !void {
-        try self.stack.append(Self{
-            .op = .{ .comb = op },
-            .stack = .init(self.stack.allocator),
-        });
+        try self.appendEnd(.{ .comb = op });
     }
 
     pub fn appendEndVari(self: *Self, op: u8) !void {
-        try self.stack.append(Self{
-            .op = .{ .vari = op },
-            .stack = .init(self.stack.allocator),
-        });
+        try self.appendEnd(.{ .vari = op });
     }
 
     pub fn appendEndExpr(self: *Self, expr: Expr) !void {
@@ -138,17 +267,11 @@ const Expr = struct {
     }
 
     pub fn appendStartComb(self: *Self, op: Combinator) !void {
-        try self.stack.insert(0, Self{
-            .op = .{ .comb = op },
-            .stack = .init(self.stack.allocator),
-        });
+        try self.appendStart(.{ .comb = op });
     }
 
     pub fn appendStartVari(self: *Self, op: u8) !void {
-        try self.stack.insert(0, Self{
-            .op = .{ .vari = op },
-            .stack = .init(self.stack.allocator),
-        });
+        try self.appendStart(.{ .vari = op });
     }
 
     pub fn appendStartExpr(self: *Self, expr: Expr) !void {
@@ -174,10 +297,16 @@ const Expr = struct {
     }
 
     pub fn clone(self: *const Self) !Self {
-        return Self{
+        const ret = Self{
             .op = self.op,
             .stack = try self.stack.clone(),
         };
+
+        for (ret.stack.items) |*expr| {
+            expr.* = try expr.clone();
+        }
+
+        return ret;
     }
 
     pub fn step(self: *Self) !bool {
@@ -236,7 +365,7 @@ const Expr = struct {
                 .Y => {
                     x = self.pop1() orelse return false;
 
-                    var Y = Expr.init(.{ .comb = .Y }, self.stack.allocator);
+                    var Y = init(.{ .comb = .Y }, self.stack.allocator);
                     try Y.appendEndExpr(try x.clone());
                     try self.appendEndExpr(Y);
                 },
@@ -255,7 +384,12 @@ const Expr = struct {
             return true;
 
         var i = self.stack.items.len;
-        while (i > 0) : (i -= 1) {}
+        while (i > 0) : (i -= 1) {
+            if (try self.stack.items[i - 1].stepNormal())
+                return true;
+        }
+
+        return false;
     }
 };
 
@@ -263,21 +397,17 @@ test "idk" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var expr = try Expr.parser("Yx", allocator);
+    var expr = try Expr.parser("+(+(+0))fx", allocator);
     defer expr.deinit();
 
-    //try expr.appendComb(.S);
+    std.debug.print("{}\n", .{expr});
 
-    _ = try expr.step();
-    _ = try expr.step();
-    _ = try expr.step();
-    _ = try expr.step();
-    std.debug.print("{c}\n", .{expr.char()});
-    for (expr.stack.items) |i| {
-        if (i.stack.items.len == 0)
-            std.debug.print("{c}\n", .{i.char()});
-        for (i.stack.items) |j| {
-            std.debug.print("{c} {c}\n", .{ i.char(), j.char() });
-        }
+    //while (try expr.stepNormal()) {
+    //    std.debug.print("{}\n", .{expr});
+    //}
+
+    for (0..5) |_| {
+        _ = try expr.stepNormal();
+        std.debug.print("{}\n", .{expr});
     }
 }
